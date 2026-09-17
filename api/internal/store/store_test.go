@@ -159,6 +159,159 @@ func TestStore_GetMissing(t *testing.T) {
 	assert.ErrorIs(t, err, ErrNoRows)
 }
 
+// validatedBatch builds already-evaluated measurements the way the HTTP
+// handler passes them to CreateMany.
+func validatedBatch(t *testing.T, rows ...struct {
+	voyage, hatch string
+	tg            float64
+}) []ValidatedMeasurement {
+	t.Helper()
+	out := make([]ValidatedMeasurement, 0, len(rows))
+	for _, row := range rows {
+		in := decision.Input{Voyage: row.voyage, Hatch: row.hatch, Tg: row.tg, Ta: 20, RH: 70}
+		r, err := decision.Evaluate(in)
+		require.NoError(t, err)
+		out = append(out, ValidatedMeasurement{Input: in, Result: *r})
+	}
+	return out
+}
+
+func row(voyage, hatch string, tg float64) struct {
+	voyage, hatch string
+	tg            float64
+} {
+	return struct {
+		voyage, hatch string
+		tg            float64
+	}{voyage, hatch, tg}
+}
+
+// TestStore_CreateMany_ChainsWithinBatchAndFromDatabase proves the batch
+// predecessor rule against an INTERLEAVED and REPEATED-hatch batch: a repeat
+// of a voyage+hatch later in the batch links to the earlier in-batch row,
+// while a hatch's first in-batch row inherits the latest committed database
+// row; a different voyage with the same hatch number is an isolated chain.
+func TestStore_CreateMany_ChainsWithinBatchAndFromDatabase(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, ":memory:")
+	require.NoError(t, err)
+	defer st.Close()
+
+	// Pre-existing chains in the database.
+	db1H := mustCreate(t, ctx, st, "V-B", "1H", 25) // id 1
+	db2H := mustCreate(t, ctx, st, "V-B", "2H", 25) // id 2
+	dbOther := mustCreate(t, ctx, st, "V-OTHER", "1H", 25)
+
+	ms := validatedBatch(t,
+		row("V-B", "1H", 24),     // b0 -> db1H (first in-batch appearance)
+		row("V-B", "3H", 25),     // b1 -> none (first measurement of 3H)
+		row("V-B", "2H", 23),     // b2 -> db2H
+		row("V-B", "1H", 26),     // b3 -> b0 (repeat later in the SAME batch)
+		row("V-B", "3H", 22),     // b4 -> b1 (in-batch repeat, interleaved order)
+		row("V-OTHER", "1H", 24), // b5 -> dbOther, not any V-B row
+	)
+
+	created, err := st.CreateMany(ctx, ms)
+	require.NoError(t, err)
+	require.Len(t, created, 6)
+
+	// Ids follow the measurement order and are contiguous.
+	for i, a := range created {
+		assert.Equal(t, int64(4+i), a.ID, "row %d keeps its array position in id order", i)
+	}
+
+	wantPrev := []struct {
+		has  bool
+		prev int64
+	}{
+		{true, db1H.ID},
+		{false, 0},
+		{true, db2H.ID},
+		{true, created[0].ID},
+		{true, created[1].ID},
+		{true, dbOther.ID},
+	}
+	for i, want := range wantPrev {
+		assert.Equal(t, want.has, created[i].HasPrev, "row %d HasPrev", i)
+		assert.Equal(t, want.prev, created[i].PrevID, "row %d PrevID", i)
+	}
+
+	// Links persist through a reload.
+	got, err := st.Get(ctx, created[3].ID)
+	require.NoError(t, err)
+	assert.True(t, got.HasPrev)
+	assert.Equal(t, created[0].ID, got.PrevID)
+
+	// The overview immediately reflects the true creation order: each hatch's
+	// MAX(id) is its LAST batch row.
+	latest, err := st.LatestByVoyage(ctx, "V-B")
+	require.NoError(t, err)
+	require.Len(t, latest, 3)
+	byHatch := map[string]int64{}
+	for _, a := range latest {
+		byHatch[a.Input.Hatch] = a.ID
+	}
+	assert.Equal(t, created[3].ID, byHatch["1H"])
+	assert.Equal(t, created[2].ID, byHatch["2H"])
+	assert.Equal(t, created[4].ID, byHatch["3H"])
+
+	list, err := st.List(ctx)
+	require.NoError(t, err)
+	assert.Len(t, list, 9)
+}
+
+// An empty batch is a harmless no-op.
+func TestStore_CreateMany_Empty(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, ":memory:")
+	require.NoError(t, err)
+	defer st.Close()
+
+	out, err := st.CreateMany(ctx, nil)
+	require.NoError(t, err)
+	assert.Nil(t, out)
+
+	list, err := st.List(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, list)
+}
+
+// TestStore_CreateMany_RollsBackWhenAnInsertFails proves the atomicity
+// guarantee at the storage layer: a failure midway through the batch rolls
+// back EVERY earlier row, leaving no partial records. Real traffic cannot
+// trigger this (rows are pre-validated), so a trigger forces the SECOND
+// insert to fail inside the same transaction.
+func TestStore_CreateMany_RollsBackWhenAnInsertFails(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, ":memory:")
+	require.NoError(t, err)
+	defer st.Close()
+
+	// Abort only from the second row onward: inside the batch transaction the
+	// first insert is already visible to the trigger's count.
+	_, err = st.db.ExecContext(ctx, `
+CREATE TRIGGER fail_second_batch_insert
+AFTER INSERT ON assessments
+WHEN (SELECT COUNT(*) FROM assessments) >= 2
+BEGIN
+    SELECT RAISE(ABORT, 'forced mid-batch failure');
+END`)
+	require.NoError(t, err)
+
+	ms := validatedBatch(t,
+		row("V-FAIL", "1H", 25),
+		row("V-FAIL", "2H", 24),
+		row("V-FAIL", "3H", 23),
+	)
+	_, err = st.CreateMany(ctx, ms)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "forced mid-batch failure")
+
+	list, err := st.List(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, list, "no partial batch and no broken predecessor may survive")
+}
+
 // mustCreateAt is the timestamp-injecting counterpart of mustCreate: it lets
 // a test give two rows the SAME created_at so latest-per-hatch selection is
 // forced onto the record id instead of timestamp recency.

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createAssessment, getAssessment, getVoyageOverview, listAssessments } from '@/lib/api.js'
+import { createAssessment, createAssessmentBatch, getAssessment, getVoyageOverview, listAssessments } from '@/lib/api.js'
 
 describe('api client', () => {
   afterEach(() => vi.restoreAllMocks())
@@ -67,5 +67,43 @@ describe('api client', () => {
     expect(res.status).toBe(200)
     expect(res.data.items[0].id).toBe(9)
     expect(res.data.items[0].verdict).toBe('allowed')
+  })
+
+  it('posts a batch wrapped in a measurements array and returns row items', async () => {
+    const measurements = [
+      { voyage: 'V1', hatch: '3H', tg: 25, ta: 20, rh: 70 },
+      { voyage: 'V1', hatch: '4H', tg: 24, ta: 20, rh: 70 },
+    ]
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ items: [{ id: 1 }, { id: 2 }] }), {
+        status: 201, headers: { 'Content-Type': 'application/json' },
+      }),
+    )
+
+    const res = await createAssessmentBatch(measurements)
+
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(String(url)).toMatch(/\/api\/assessments\/batch$/)
+    expect(init.method).toBe('POST')
+    expect(JSON.parse(init.body)).toEqual({ measurements })
+    expect(res.status).toBe(201)
+    expect(res.data.items.map((i) => i.id)).toEqual([1, 2])
+  })
+
+  it('returns row-numbered 422 field errors for a batch without throwing', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({
+        error: '批量输入校验失败，未生成任何记录',
+        fields: [{ row: 2, field: 'tg', code: 'out_of_range', message: 'x' }],
+      }), { status: 422, headers: { 'Content-Type': 'application/json' } }),
+    )
+
+    const res = await createAssessmentBatch([
+      { voyage: 'v', hatch: 'h', tg: 1, ta: 20, rh: 70 },
+      { voyage: 'v', hatch: 'h', tg: 999, ta: 20, rh: 70 },
+    ])
+    expect(res.status).toBe(422)
+    expect(res.data.fields[0].row).toBe(2)
+    expect(res.data.fields[0].field).toBe('tg')
   })
 })

@@ -127,6 +127,15 @@ func (s *Store) columnExists(ctx context.Context, table, column string) (bool, e
 // Close releases the database handle.
 func (s *Store) Close() error { return s.db.Close() }
 
+// ValidatedMeasurement is one row of a batch submission. The HTTP layer has
+// already parsed the row and decision.Evaluate has confirmed it is legal and
+// produced the result, so the store must never re-validate: it only persists
+// the rows in order and fixes their predecessor links.
+type ValidatedMeasurement struct {
+	Input  decision.Input
+	Result decision.Result
+}
+
 // Create inserts one assessment and returns it with its creation timestamp.
 // Inside one transaction the most recent earlier row for the same voyage and
 // hatch (in id/creation order) is locked as this row's predecessor; a first
@@ -184,6 +193,103 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		a.HasPrev = true
 	}
 	return a, nil
+}
+
+// CreateMany persists an ORDERED batch of already-validated measurements in a
+// SINGLE transaction. Rows are inserted strictly in slice order, so their
+// ids follow the measurement order the chief officer took them.
+//
+// The predecessor of each row is the most recent EARLIER row of the same
+// voyage+hatch: a row inserted earlier in THIS batch wins (rows of the same
+// voyage+hatch chain inside the batch, e.g. two 3H measurements separated by
+// other hatches), otherwise the lookup falls back to the latest valid row
+// already in the database; a brand new voyage+hatch gets no predecessor.
+//
+// Because the whole batch shares one transaction, any insert failure rolls
+// back every earlier row too: the database can never retain a partial batch
+// or a predecessor link that points past a missing row. The caller validates
+// every row first, so an illegal batch is rejected before CreateMany runs.
+func (s *Store) CreateMany(ctx context.Context, ms []ValidatedMeasurement) ([]*Assessment, error) {
+	if len(ms) == 0 {
+		return nil, nil
+	}
+	now := time.Now().UTC()
+	createdAt := now.Format(time.RFC3339Nano)
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after Commit
+
+	// Last in-batch id per voyage+hatch, in insertion order. The struct key
+	// (not a concatenated string) cannot alias two pairs even if a code were
+	// to contain a NUL byte; slice order guarantees the stored id is the most
+	// recent earlier row for that chain.
+	type chainKey struct{ voyage, hatch string }
+	lastInBatch := map[chainKey]int64{}
+	selectPrev, err := tx.PrepareContext(ctx, `
+SELECT id FROM assessments
+WHERE voyage = ? AND hatch = ?
+ORDER BY id DESC
+LIMIT 1`)
+	if err != nil {
+		return nil, fmt.Errorf("prepare predecessor lookup: %w", err)
+	}
+	defer selectPrev.Close()
+	insertRow, err := tx.PrepareContext(ctx, `
+INSERT INTO assessments (voyage, hatch, tg, ta, rh, gamma, td, delta, verdict, created_at, prev_id)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		return nil, fmt.Errorf("prepare assessment insert: %w", err)
+	}
+	defer insertRow.Close()
+
+	out := make([]*Assessment, 0, len(ms))
+	for i := range ms {
+		in, r := ms[i].Input, ms[i].Result
+		key := chainKey{in.Voyage, in.Hatch}
+
+		var prev sql.NullInt64
+		if batchPrev, ok := lastInBatch[key]; ok {
+			// A repeat of this voyage+hatch later in the SAME batch chains to
+			// the earlier in-batch row, never to a database row behind it.
+			prev = sql.NullInt64{Int64: batchPrev, Valid: true}
+		} else {
+			// First appearance in the batch: inherit the chain's latest
+			// already-committed predecessor, if any.
+			if err := selectPrev.QueryRowContext(ctx, in.Voyage, in.Hatch).Scan(&prev); err != nil {
+				if err != sql.ErrNoRows {
+					return nil, fmt.Errorf("lock predecessor: %w", err)
+				}
+				// sql.ErrNoRows: first measurement, prev stays NULL.
+			}
+		}
+
+		res, err := insertRow.ExecContext(ctx,
+			in.Voyage, in.Hatch, in.Tg, in.Ta, in.RH,
+			r.Gamma, r.Td, r.Delta, r.Verdict, createdAt, prev)
+		if err != nil {
+			return nil, fmt.Errorf("insert assessment: %w", err)
+		}
+		id, err := res.LastInsertId()
+		if err != nil {
+			return nil, err
+		}
+		lastInBatch[key] = id
+
+		a := &Assessment{ID: id, Input: in, Result: r, CreatedAt: now}
+		if prev.Valid {
+			a.PrevID = prev.Int64
+			a.HasPrev = true
+		}
+		out = append(out, a)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit batch: %w", err)
+	}
+	return out, nil
 }
 
 // List returns all assessments, newest first.

@@ -40,3 +40,16 @@ export async function createAssessment(payload) {
   })
   return parse(res)
 }
+
+// Batch transcription before berthing: submit up to twenty ordered
+// measurements at once. The server validates and saves every row in one
+// transaction; a 422 carries per-row field errors ({row, field, ...}) and a
+// 201 returns the same per-record DTOs as createAssessment, in row order.
+export async function createAssessmentBatch(measurements) {
+  const res = await fetch(`${BASE}/assessments/batch`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ measurements }),
+  })
+  return parse(res)
+}

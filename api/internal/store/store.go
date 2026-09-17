@@ -37,6 +37,15 @@ type Store struct {
 // ErrNoRows is returned by Get for unknown ids.
 var ErrNoRows = sql.ErrNoRows
 
+// BatchItem is one validated (input + evaluated result) row of a batch
+// submission. Validation always happens in the HTTP layer before the store
+// is called, so CreateBatch never has to reject a row halfway: every item
+// here is legal and is persisted in the given order.
+type BatchItem struct {
+	Input  decision.Input
+	Result decision.Result
+}
+
 // Open opens (creating if needed) the database at path and applies the
 // schema. Use ":memory:" for tests.
 func Open(ctx context.Context, path string) (*Store, error) {
@@ -141,7 +150,39 @@ func (s *Store) Create(ctx context.Context, in decision.Input, r decision.Result
 // creation timestamp (or carry a skewed one), proving the "latest per hatch"
 // query chooses by record id rather than by the timestamp text.
 func (s *Store) createAt(ctx context.Context, in decision.Input, r decision.Result, now time.Time) (*Assessment, error) {
-	createdAt := now.Format(time.RFC3339Nano)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after Commit
+
+	a, err := insertInTx(ctx, tx, in, r, now)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit assessment: %w", err)
+	}
+	return a, nil
+}
+
+// CreateBatch persists an ordered list of already-validated assessments in a
+// SINGLE transaction, returning them in submission order with consecutive
+// creation timestamps. Predecessors are resolved row by row inside that
+// transaction:
+//
+//   - for a repeated voyage+hatch appearing earlier in THIS batch, the later
+//     row links to that earlier row (which was just inserted and is visible to
+//     the subsequent SELECT within the same transaction);
+//   - otherwise it links to the most recent valid row already committed in
+//     the database, exactly like a standalone Create;
+//   - the first measurement of a voyage+hatch gets no predecessor.
+//
+// Because predecessor lookup and every insert share one transaction, a
+// failure on any row rolls the whole batch back: no partial rows and no
+// dangling chain links can survive.
+func (s *Store) CreateBatch(ctx context.Context, items []BatchItem) ([]*Assessment, error) {
+	now := time.Now().UTC()
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -149,8 +190,34 @@ func (s *Store) createAt(ctx context.Context, in decision.Input, r decision.Resu
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op after Commit
 
+	out := make([]*Assessment, len(items))
+	for i, item := range items {
+		// A strictly monotone (nanosecond-resolution) timestamp keeps the
+		// persisted creation order identical to submission order even when
+		// several rows land in one wall-clock tick. Latestness is still
+		// decided by MAX(id) everywhere; this only keeps created_at honest.
+		a, err := insertInTx(ctx, tx, item.Input, item.Result, now.Add(time.Duration(i)))
+		if err != nil {
+			return nil, fmt.Errorf("batch row %d: %w", i+1, err)
+		}
+		out[i] = a
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit batch: %w", err)
+	}
+	return out, nil
+}
+
+// insertInTx is the shared transactional core of both Create and CreateBatch.
+// It links the row to the latest earlier assessment of the same voyage+hatch
+// visible within tx — which, inside a batch, already includes that batch's
+// earlier inserts — and then inserts it. Called with an open transaction; the
+// caller owns Commit/Rollback.
+func insertInTx(ctx context.Context, tx *sql.Tx, in decision.Input, r decision.Result, now time.Time) (*Assessment, error) {
+	createdAt := now.Format(time.RFC3339Nano)
+
 	var prev sql.NullInt64
-	err = tx.QueryRowContext(ctx, `
+	err := tx.QueryRowContext(ctx, `
 SELECT id FROM assessments
 WHERE voyage = ? AND hatch = ?
 ORDER BY id DESC
@@ -173,9 +240,6 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	id, err := res.LastInsertId()
 	if err != nil {
 		return nil, err
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("commit assessment: %w", err)
 	}
 
 	a := &Assessment{ID: id, Input: in, Result: r, CreatedAt: now}
@@ -293,6 +357,14 @@ func (s *Store) SetPrevIDForTest(ctx context.Context, id, prevID int64) error {
 		return fmt.Errorf("set prev_id: %w", err)
 	}
 	return nil
+}
+
+// ExecForTest is a narrow test seam that runs arbitrary DDL/SQL (e.g. a
+// BEFORE INSERT trigger simulating a mid-batch storage failure) so HTTP-level
+// tests can prove the single-transaction rollback. Real traffic never uses
+// it. Tests only.
+func (s *Store) ExecForTest(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return s.db.ExecContext(ctx, query, args...)
 }
 
 // SetCreatedAtForTest is a narrow test seam that overwrites a row's creation

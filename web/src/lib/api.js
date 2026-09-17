@@ -40,3 +40,17 @@ export async function createAssessment(payload) {
   })
   return parse(res)
 }
+
+// Bulk entry for the chief officer's pre-berth multi-hatch readings. The
+// server validates EVERY row with the same rules as createAssessment and
+// saves all rows in one transaction; any invalid row rejects the whole
+// batch. The browser only sends the ordered inputs and renders results —
+// it never computes a dew point or chains predecessors itself.
+export async function createAssessmentBatch(items) {
+  const res = await fetch(`${BASE}/assessments/batch`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items }),
+  })
+  return parse(res)
+}

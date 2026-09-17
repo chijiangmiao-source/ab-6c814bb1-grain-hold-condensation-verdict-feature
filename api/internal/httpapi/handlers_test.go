@@ -591,6 +591,333 @@ func TestHealthz(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 }
 
+// ---------------------------------------------------------------------------
+// Bulk batch endpoint POST /api/assessments/batch
+// ---------------------------------------------------------------------------
+
+func postBatch(t *testing.T, r http.Handler, items []map[string]any) (int, map[string]any) {
+	t.Helper()
+	w := do(t, r, http.MethodPost, "/api/assessments/batch", map[string]any{"items": items})
+	var got map[string]any
+	if w.Body.Len() > 0 {
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+	}
+	return w.Code, got
+}
+
+func postBatchRaw(t *testing.T, r http.Handler, raw string) (int, map[string]any) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/api/assessments/batch", bytes.NewBufferString(raw))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	var got map[string]any
+	if w.Body.Len() > 0 {
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+	}
+	return w.Code, got
+}
+
+func batchRow(voyage, hatch string, tg, ta, rh float64) map[string]any {
+	return map[string]any{"voyage": voyage, "hatch": hatch, "tg": tg, "ta": ta, "rh": rh}
+}
+
+// End-to-end through Gin + SQLite: an interleaved batch with a repeated hatch
+// chains inside the batch, other hatches continue the database predecessor,
+// the POST rows keep the single-create shape, and detail links/overview
+// latest selection are all correct.
+func TestBatch_SuccessChainsAndShapes(t *testing.T) {
+	st, r := setupWithStore(t)
+
+	// Committed history the batch must continue (1H) and ignore (other voyage).
+	pre := submitOK(t, r, "V-BATCH", "1H", 30)
+	submitOK(t, r, "V-OTHER", "2H", 30)
+
+	w, got := postBatch(t, r, []map[string]any{
+		batchRow("V-BATCH", "1H", 25, 20, 70), // row 1 -> chains to pre
+		batchRow("V-BATCH", "2H", 24, 20, 70), // row 2 -> first 2H for V-BATCH
+		batchRow("V-BATCH", "1H", 26, 20, 70), // row 3 -> chains to row 1
+		batchRow("V-BATCH", "3H", 20, 20, 70), // row 4 -> first 3H
+		batchRow("V-BATCH", "1H", 22, 20, 70), // row 5 -> chains to row 3
+	})
+	require.Equal(t, http.StatusCreated, w, got)
+
+	items, ok := got["items"].([]any)
+	require.True(t, ok)
+	require.Len(t, items, 5)
+
+	var ids []float64
+	for i, it := range items {
+		row := it.(map[string]any)
+		// Same shape as a single-create POST response: formula present,
+		// comparison never present on create responses.
+		assert.Contains(t, row, "formula", "row %d carries formula", i+1)
+		assert.Contains(t, row, "id")
+		assert.NotContains(t, row, "comparison", "row %d never carries comparison", i+1)
+		assert.Equal(t, "V-BATCH", row["voyage"])
+		ids = append(ids, row["id"].(float64))
+	}
+	// Creation order: strictly increasing ids matching submission order.
+	for i := 1; i < len(ids); i++ {
+		assert.Greater(t, ids[i], ids[i-1], "rows persist in submission order")
+	}
+
+	detailOf := func(id float64) map[string]any {
+		w, d := getMap(t, r, "/api/assessments/"+strconv.FormatFloat(id, 'f', 0, 64))
+		require.Equal(t, http.StatusOK, w)
+		return d
+	}
+
+	// Row 1 continues the committed 1H chain; row 2/4 are first measurements;
+	// repeated 1H rows link to the earlier IN-BATCH rows.
+	assert.Equal(t, pre["id"], detailOf(ids[0])["comparison"].(map[string]any)["previous"].(map[string]any)["id"])
+	assert.NotContains(t, detailOf(ids[1]), "comparison")
+	cmp3 := detailOf(ids[2])["comparison"].(map[string]any)
+	assert.Equal(t, ids[0], cmp3["previous"].(map[string]any)["id"], "later same-hatch row links the earlier batch row")
+	assert.NotContains(t, detailOf(ids[3]), "comparison")
+	cmp5 := detailOf(ids[4])["comparison"].(map[string]any)
+	assert.Equal(t, ids[2], cmp5["previous"].(map[string]any)["id"], "the third 1H links the second, not the first")
+
+	// Overview latest per hatch follows MAX(id): 1H -> row 5, 2H -> row 2, 3H -> row 4.
+	w, ov := getMap(t, r, "/api/voyages/V-BATCH/hatches/latest")
+	require.Equal(t, http.StatusOK, w)
+	ovItems := ov["items"].([]any)
+	require.Len(t, ovItems, 3)
+	byHatch := map[string]any{}
+	for _, it := range ovItems {
+		row := it.(map[string]any)
+		byHatch[row["hatch"].(string)] = row
+		assert.NotContains(t, row, "formula")
+		assert.NotContains(t, row, "comparison")
+	}
+	assert.Equal(t, ids[4], byHatch["1H"].(map[string]any)["id"])
+	assert.Equal(t, ids[1], byHatch["2H"].(map[string]any)["id"])
+	assert.Equal(t, ids[3], byHatch["3H"].(map[string]any)["id"])
+
+	// List reflects the new rows in real creation order (newest first).
+	w, list := getMap(t, r, "/api/assessments")
+	require.Equal(t, http.StatusOK, w)
+	firstIDs := []float64{}
+	for _, it := range list["items"].([]any)[:5] {
+		firstIDs = append(firstIDs, it.(map[string]any)["id"].(float64))
+	}
+	assert.Equal(t, []float64{ids[4], ids[3], ids[2], ids[1], ids[0]}, firstIDs)
+
+	// The batch is isolated from the identically-numbered hatch of another voyage.
+	w, otherOv := getMap(t, r, "/api/voyages/V-OTHER/hatches/latest")
+	require.Equal(t, http.StatusOK, w)
+	otherItems := otherOv["items"].([]any)
+	require.Len(t, otherItems, 1)
+	assert.Equal(t, "30", fmt.Sprint(otherItems[0].(map[string]any)["tg"]))
+	_ = st
+}
+
+// A 20-row batch is accepted; a 21st row is a 400 format error and nothing is
+// saved.
+func TestBatch_SizeLimits(t *testing.T) {
+	r := setup(t)
+
+	mk := func(n int) []map[string]any {
+		rows := make([]map[string]any, n)
+		for i := range rows {
+			rows[i] = batchRow("V-SIZE", fmt.Sprintf("H%d", i), 25, 20, 70)
+		}
+		return rows
+	}
+
+	w, got := postBatch(t, r, mk(20))
+	require.Equal(t, http.StatusCreated, w, got)
+	assert.Len(t, got["items"].([]any), 20)
+
+	w, got = postBatch(t, r, mk(21))
+	require.Equal(t, http.StatusBadRequest, w, got)
+	assert.Contains(t, got["error"], "最多 20 行")
+
+	w, list := getMap(t, r, "/api/assessments")
+	require.Equal(t, http.StatusOK, w)
+	assert.Len(t, list["items"].([]any), 20, "the rejected 21-row request saved nothing")
+
+	// An empty batch is a 400 and saves nothing.
+	w, got = postBatch(t, r, []map[string]any{})
+	require.Equal(t, http.StatusBadRequest, w, got)
+	assert.Contains(t, got["error"], "至少需要一行")
+}
+
+// An invalid MIDDLE row rejects the WHOLE batch: 422 names the row number and
+// the original field errors, and neither the earlier nor later valid rows are
+// persisted — no partial records, no broken links.
+func TestBatch_MiddleRowInvalidRollsBackEntireBatch(t *testing.T) {
+	r := setup(t)
+
+	// Pre-existing latest 1H must remain the chain head after rollback.
+	pre := submitOK(t, r, "V-ROLL", "1H", 30)
+
+	w, got := postBatch(t, r, []map[string]any{
+		batchRow("V-ROLL", "1H", 25, 20, 70),  // valid
+		batchRow("V-ROLL", "2H", 24, 20, 70),  // valid
+		batchRow("V-ROLL", "1H", 999, 20, 70), // row 3: tg out of range
+		batchRow("V-ROLL", "3H", 5, 28, 95),   // valid (denied verdict, but legal)
+	})
+	require.Equal(t, http.StatusUnprocessableEntity, w, got)
+	assert.Contains(t, got["error"], "整批未保存")
+
+	// Grouped rows[] carry the 1-based row number and the original field error.
+	rowErrs, ok := got["rows"].([]any)
+	require.True(t, ok)
+	require.Len(t, rowErrs, 1)
+	re := rowErrs[0].(map[string]any)
+	assert.Equal(t, float64(3), re["row"])
+	fields := re["fields"].([]any)
+	require.Len(t, fields, 1)
+	assert.Equal(t, "tg", fields[0].(map[string]any)["field"])
+	assert.Equal(t, "out_of_range", fields[0].(map[string]any)["code"])
+	assert.Contains(t, fields[0].(map[string]any)["message"], "60.0")
+
+	// Flat fields[] repeat the row number for direct per-row rendering.
+	flat := got["fields"].([]any)
+	require.Len(t, flat, 1)
+	assert.Equal(t, float64(3), flat[0].(map[string]any)["row"])
+
+	// Nothing from the batch reached SQLite.
+	w, list := getMap(t, r, "/api/assessments")
+	require.Equal(t, http.StatusOK, w)
+	require.Len(t, list["items"].([]any), 1)
+	assert.Equal(t, pre["id"], list["items"].([]any)[0].(map[string]any)["id"])
+
+	// A subsequent valid submission chains exactly as if the batch never happened.
+	after := submitOK(t, r, "V-ROLL", "1H", 26)
+	wd, d := getMap(t, r, "/api/assessments/"+
+		strconv.FormatFloat(after["id"].(float64), 'f', 0, 64))
+	require.Equal(t, http.StatusOK, wd)
+	assert.Equal(t, pre["id"],
+		d["comparison"].(map[string]any)["previous"].(map[string]any)["id"])
+}
+
+// Several bad rows/fields are all reported at once, each with its row number.
+func TestBatch_ReportsEveryInvalidRowAndField(t *testing.T) {
+	r := setup(t)
+
+	w, got := postBatch(t, r, []map[string]any{
+		batchRow("V-X", "1H", 25, 20, 70),   // fine
+		batchRow("V-X", "2H", 999, 200, 70), // row 2: tg + ta bad
+		batchRow("V-X", "3H", 25, 20, 0),    // row 3: rh bad
+	})
+	require.Equal(t, http.StatusUnprocessableEntity, w, got)
+	rows := got["rows"].([]any)
+	require.Len(t, rows, 2)
+	assert.Equal(t, float64(2), rows[0].(map[string]any)["row"])
+	assert.Len(t, rows[0].(map[string]any)["fields"].([]any), 2)
+	assert.Equal(t, float64(3), rows[1].(map[string]any)["row"])
+
+	flat := got["fields"].([]any)
+	assert.Len(t, flat, 3)
+}
+
+// Non-finite and wrong-typed values reuse the single-create codes, each
+// tagged with its row number.
+func TestBatch_NonFiniteAndWrongTypeCarryRowNumber(t *testing.T) {
+	r := setup(t)
+
+	// Row 1 carries an overflowing numeric literal; row 2 a string-typed tg.
+	w, got := postBatchRaw(t, r, `{"items":[
+		{"voyage":"V-NF","hatch":"1H","tg":1e999,"ta":20,"rh":70},
+		{"voyage":"V-NF","hatch":"2H","tg":"abc","ta":20,"rh":70}
+	]}`)
+	require.Equal(t, http.StatusUnprocessableEntity, w, got)
+	flat := got["fields"].([]any)
+	require.Len(t, flat, 2)
+	first := flat[0].(map[string]any)
+	second := flat[1].(map[string]any)
+	assert.Equal(t, float64(1), first["row"])
+	assert.Equal(t, "tg", first["field"])
+	assert.Equal(t, "not_finite", first["code"])
+	assert.Equal(t, float64(2), second["row"])
+	assert.Equal(t, "wrong_type", second["code"])
+
+	// Nothing persisted.
+	w, list := getMap(t, r, "/api/assessments")
+	require.Equal(t, http.StatusOK, w)
+	assert.Empty(t, list["items"])
+}
+
+// An unknown field inside a row is a 400 like in single creation, and saves
+// nothing.
+func TestBatch_UnknownRowFieldIs400(t *testing.T) {
+	r := setup(t)
+	w, got := postBatch(t, r, []map[string]any{
+		{"voyage": "V-U", "hatch": "1H", "tg": 25, "ta": 20, "rh": 70, "extra": 1},
+	})
+	require.Equal(t, http.StatusBadRequest, w, got)
+	assert.Contains(t, got["error"], "第 1 行出现未知字段")
+	w, list := getMap(t, r, "/api/assessments")
+	require.Equal(t, http.StatusOK, w)
+	assert.Empty(t, list["items"])
+}
+
+// Structural problems are 400 (format), not 422 field validation: missing or
+// non-array items, scalar/null rows, unknown top-level keys, duplicate keys.
+func TestBatch_StructuralErrorsAre400(t *testing.T) {
+	r := setup(t)
+
+	cases := []struct {
+		name string
+		raw  string
+		hint string
+	}{
+		{"null body element", `{"items":[{"voyage":"V","hatch":"H","tg":25,"ta":20,"rh":70},null]}`, "JSON 对象"},
+		{"scalar element", `{"items":[1,2]}`, "JSON 对象"},
+		{"array element", `{"items":[["x"]]}`, "JSON 对象"},
+		{"items not array", `{"items":{"voyage":"V"}}`, "数组"},
+		{"missing items", `{"rows":[]}`, "items"},
+		{"unknown top key", `{"items":[],"extra":1}`, "未知顶层字段"},
+		{"duplicate row key", `{"items":[{"voyage":"V","hatch":"H","tg":25,"tg":26,"ta":20,"rh":70}]}`, "重复声明"},
+		{"trailing junk", `{"items":[]}]`, "非法"},
+		{"top level null", `null`, "JSON 对象"},
+		{"top level array", `[]`, "JSON 对象"},
+		{"trailing token", `{"items":[]}x`, "非法"},
+	}
+	for _, c := range cases {
+		w, got := postBatchRaw(t, r, c.raw)
+		require.Equalf(t, http.StatusBadRequest, w, "%s: got %d %v", c.name, w, got)
+		assert.Containsf(t, got["error"], c.hint, "%s message", c.name)
+		assert.NotContainsf(t, got, "fields", "%s is not field validation", c.name)
+	}
+
+	// Nothing structural ever persisted.
+	w, list := getMap(t, r, "/api/assessments")
+	require.Equal(t, http.StatusOK, w)
+	assert.Empty(t, list["items"])
+}
+
+// A genuine persistence failure mid-batch rolls back via one transaction:
+// the API answers 500 and leaves no rows behind.
+func TestBatch_StorageFailureRollsBack(t *testing.T) {
+	st, r := setupWithStore(t)
+
+	// Installed through the test seam path: a BEFORE INSERT trigger aborts
+	// rows for a sentinel hatch placed in the middle of the batch.
+	_, err := st.ExecForTest(context.Background(), `
+CREATE TRIGGER trg_batch_fail
+BEFORE INSERT ON assessments
+WHEN NEW.hatch = 'BOOM'
+BEGIN
+	SELECT RAISE(ABORT, 'simulated storage failure');
+END`)
+	require.NoError(t, err)
+
+	w, got := postBatch(t, r, []map[string]any{
+		batchRow("V-FAIL", "1H", 25, 20, 70),
+		batchRow("V-FAIL", "BOOM", 24, 20, 70),
+		batchRow("V-FAIL", "1H", 23, 20, 70),
+	})
+	require.Equal(t, http.StatusInternalServerError, w, got)
+	assert.Contains(t, got["error"], "回滚")
+
+	w, list := getMap(t, r, "/api/assessments")
+	require.Equal(t, http.StatusOK, w)
+	assert.Empty(t, list["items"], "single transaction leaves no partial rows")
+}
+
 func submitOK(t *testing.T, r http.Handler, voyage, hatch string, tg float64) map[string]any {
 	t.Helper()
 	body := map[string]any{"voyage": voyage, "hatch": hatch, "tg": tg, "ta": 20.0, "rh": 70.0}

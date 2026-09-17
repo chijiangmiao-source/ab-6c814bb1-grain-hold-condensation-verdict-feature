@@ -31,6 +31,26 @@ async function post(body) {
   return { status: res.status, body: text ? JSON.parse(text) : null }
 }
 
+// postBatch posts the ordered bulk envelope to the batch endpoint.
+async function postBatch(items) {
+  const res = await fetch(`${BASE}/api/assessments/batch`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items }),
+  })
+  const text = await res.text()
+  return { status: res.status, body: text ? JSON.parse(text) : null }
+}
+
+// Independent Magnus recomputation for one measurement row.
+function evaluateRow({ tg, ta, rh }) {
+  const gamma = Math.log(rh / 100) + (A * ta) / (B + ta)
+  const td = (B * gamma) / (A - gamma)
+  const delta = tg - td
+  const verdict = delta > 2 ? 'allowed' : delta < -2 ? 'denied' : 'retest'
+  return { gamma, td, delta, verdict }
+}
+
 async function main() {
   // 1. Health.
   const h = await fetch(`${BASE}/api/healthz`).then((r) => r.json())
@@ -178,6 +198,105 @@ async function main() {
   // Malformed path percent-encoding -> explicit request error (400).
   const badEnc = await fetch(`${BASE}/api/voyages/a%zz/hatches/latest`)
   expect(badEnc.status === 400, `malformed path encoding is a 400 request error (got ${badEnc.status})`)
+
+  // 3d. Bulk batch endpoint: ordered multi-hatch entry in ONE transaction.
+  // The probe independently recomputes every row, then proves (a) in-batch
+  // predecessor linking for interleaved/repeated hatches, (b) overview
+  // latest items follow MAX(id), and (c) an invalid middle row rolls the
+  // whole batch back.
+  const batchVoyage = 'ACCEPT-BATCH'
+  // A committed predecessor for 1H that the batch must continue.
+  const batchPre = await post({ voyage: batchVoyage, hatch: '1H', tg: 30, ta: 20, rh: 70 })
+  expect(batchPre.status === 201, 'pre-batch 1H measurement is 201')
+
+  // Measurement order interleaves three hatches; 1H repeats twice.
+  const batchInputs = [
+    { voyage: batchVoyage, hatch: '1H', tg: 25, ta: 20, rh: 70 },
+    { voyage: batchVoyage, hatch: '2P', tg: 24, ta: 20, rh: 70 },
+    { voyage: batchVoyage, hatch: '1H', tg: 26, ta: 20, rh: 70 },
+    { voyage: batchVoyage, hatch: '3H', tg: 20, ta: 20, rh: 70 },
+    { voyage: batchVoyage, hatch: '1H', tg: 22, ta: 20, rh: 70 },
+  ]
+  const batchRes = await postBatch(batchInputs)
+  expect(batchRes.status === 201, `valid batch is 201 (got ${batchRes.status})`)
+  const batchItems = batchRes.body.items
+  expect(Array.isArray(batchItems) && batchItems.length === 5, 'batch response carries 5 ordered rows')
+
+  // Each row: independent Magnus math, single-create row shape (formula
+  // present, comparison absent), strictly increasing ids in submission order.
+  for (let i = 0; i < batchInputs.length; i++) {
+    const inp = batchInputs[i]
+    const row = batchItems[i]
+    expect(row.hatch === inp.hatch && row.voyage === batchVoyage, `row ${i + 1} keeps its voyage/hatch`)
+    const exp = evaluateRow(inp)
+    expect(Math.abs(row.delta - exp.delta) < 1e-12, `row ${i + 1} unrounded Δ matches independent math`)
+    expect(row.verdict === exp.verdict, `row ${i + 1} verdict ${row.verdict} === ${exp.verdict}`)
+    expect(row.delta_display === round2(exp.delta), `row ${i + 1} Δ display rounds to 2 dp`)
+    expect(row.formula && typeof row.formula.delta_line === 'string', `row ${i + 1} keeps the single-create formula block`)
+    expect(row.comparison === undefined, `row ${i + 1} POST shape never carries comparison`)
+    if (i > 0) expect(row.id > batchItems[i - 1].id, 'batch ids increase in submission order')
+  }
+  const bIds = batchItems.map((r) => r.id)
+
+  // In-batch predecessor links resolved through detail responses:
+  //  row1 1H -> committed pre;  row2 2P -> first measurement;
+  //  row3 1H -> row1;           row4 3H -> first measurement;
+  //  row5 1H -> row3 (NOT row1 and NOT the pre-batch row).
+  const bd1 = await fetch(`${BASE}/api/assessments/${bIds[0]}`).then((r) => r.json())
+  const bd2 = await fetch(`${BASE}/api/assessments/${bIds[1]}`).then((r) => r.json())
+  const bd3 = await fetch(`${BASE}/api/assessments/${bIds[2]}`).then((r) => r.json())
+  const bd4 = await fetch(`${BASE}/api/assessments/${bIds[3]}`).then((r) => r.json())
+  const bd5 = await fetch(`${BASE}/api/assessments/${bIds[4]}`).then((r) => r.json())
+  expect(bd1.comparison && bd1.comparison.available === true && bd1.comparison.previous.id === batchPre.body.id,
+    'first batch 1H row continues the committed database chain')
+  expect(bd2.comparison === undefined, 'first 2P in the batch is a first measurement')
+  expect(bd4.comparison === undefined, 'first 3H in the batch is a first measurement')
+  expect(bd3.comparison.available === true && bd3.comparison.previous.id === bIds[0],
+    'later same-hatch row links the EARLIER BATCH row')
+  expect(bd5.comparison.available === true && bd5.comparison.previous.id === bIds[2],
+    'third 1H links the second in-batch 1H, with no broken chain')
+
+  // Overview immediately reflects the true creation-order latest items.
+  const batchOv = await fetch(`${BASE}/api/voyages/${encodeURIComponent(batchVoyage)}/hatches/latest`)
+    .then((r) => r.json())
+  expect(batchOv.items.map((i) => i.hatch).join(',') === '1H,2P,3H', 'overview rows sorted by hatch')
+  const ovById = Object.fromEntries(batchOv.items.map((i) => [i.hatch, i]))
+  expect(ovById['1H'].id === bIds[4], `1H latest is the last in-batch 1H #${bIds[4]}, got #${ovById['1H'].id}`)
+  expect(ovById['2P'].id === bIds[1], '2P latest is its only batch row')
+  expect(ovById['3H'].id === bIds[3], '3H latest is its only batch row')
+
+  // Invalid MIDDLE row -> 422 naming the row, whole batch rolled back.
+  const rollVoyage = 'ACCEPT-BATCH-ROLL'
+  const beforeCount = (await fetch(`${BASE}/api/assessments`).then((r) => r.json())).items.length
+  const rollRes = await postBatch([
+    { voyage: rollVoyage, hatch: '1H', tg: 25, ta: 20, rh: 70 },
+    { voyage: rollVoyage, hatch: '2P', tg: 999, ta: 20, rh: 70 }, // row 2 out of range
+    { voyage: rollVoyage, hatch: '3H', tg: 5, ta: 28, rh: 95 },
+  ])
+  expect(rollRes.status === 422, `out-of-range middle row is 422 (got ${rollRes.status})`)
+  expect(rollRes.body.rows && rollRes.body.rows[0].row === 2, '422 names the 1-based problem row')
+  expect(rollRes.body.rows[0].fields.some((f) => f.field === 'tg' && f.code === 'out_of_range'),
+    '422 keeps the original field error')
+  expect(rollRes.body.fields && rollRes.body.fields[0].row === 2, 'flat fields[] also carries the row number')
+  const afterCount = (await fetch(`${BASE}/api/assessments`).then((r) => r.json())).items.length
+  expect(afterCount === beforeCount, `rollback leaves no partial rows (${beforeCount} == ${afterCount})`)
+  const rollList = await fetch(`${BASE}/api/assessments`).then((r) => r.json())
+  expect(rollList.items.every((i) => i.voyage !== rollVoyage), 'none of the rejected batch rows persisted')
+
+  // No broken links: after the rollback a fresh measurement starts the chain
+  // as a true first measurement (no phantom predecessor from the batch).
+  const rollAfter = await post({ voyage: rollVoyage, hatch: '1H', tg: 25, ta: 20, rh: 70 })
+  const rollAfterDetail = await fetch(`${BASE}/api/assessments/${rollAfter.body.id}`).then((r) => r.json())
+  expect(rollAfterDetail.comparison === undefined, 'rolled-back batch leaves no dangling predecessor')
+
+  // Size cap and structural rules.
+  const capRows = Array.from({ length: 21 }, (_, i) => ({
+    voyage: 'ACCEPT-BATCH-CAP', hatch: `H${i}`, tg: 25, ta: 20, rh: 70,
+  }))
+  const capRes = await postBatch(capRows)
+  expect(capRes.status === 400, `21 rows exceed the cap as a 400 format error (got ${capRes.status})`)
+  const emptyRes = await postBatch([])
+  expect(emptyRes.status === 400, 'an empty batch is 400')
 
   // Existing POST/list/detail shapes are untouched by the new endpoint.
   const sampleDetail = await fetch(`${BASE}/api/assessments/${body.id}`).then((r) => r.json())

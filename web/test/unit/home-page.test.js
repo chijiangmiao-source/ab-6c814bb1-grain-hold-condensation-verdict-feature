@@ -14,7 +14,7 @@ async function fill(wrapper, values) {
 }
 
 async function submit(wrapper) {
-  await wrapper.find('button').trigger('submit.prevent')
+  await wrapper.find('form').trigger('submit.prevent')
   await flushPromises()
 }
 
@@ -134,8 +134,7 @@ describe('HomePage form', () => {
     expect(w.find('.result').text()).toContain('允许通风')
   })
 
-  it('offers one overview entry per distinct voyage, with an encoded link', async () => {
-    const items = [
+  it('offers one overview entry per distinct voyage, with an encoded link', async () => {    const items = [
       { id: 3, voyage: 'V-1', hatch: '3H', tg: 25, ta: 20, rh: 70, delta_display: 10.64, verdict: 'allowed' },
       { id: 2, voyage: 'V-2', hatch: '1H', tg: 5, ta: 28, rh: 95, delta_display: -22, verdict: 'denied' },
       { id: 1, voyage: 'V-1', hatch: '2P', tg: 24, ta: 20, rh: 70, delta_display: 9.64, verdict: 'allowed' },

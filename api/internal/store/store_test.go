@@ -159,6 +159,150 @@ func TestStore_GetMissing(t *testing.T) {
 	assert.ErrorIs(t, err, ErrNoRows)
 }
 
+// batchRow builds one already-evaluated batch item, the contract the HTTP
+// layer hands to CreateBatch (validation happens before the store call).
+func batchRow(t *testing.T, voyage, hatch string, tg float64) BatchItem {
+	t.Helper()
+	in := decision.Input{Voyage: voyage, Hatch: hatch, Tg: tg, Ta: 20, RH: 70}
+	r, err := decision.Evaluate(in)
+	require.NoError(t, err)
+	return BatchItem{Input: in, Result: *r}
+}
+
+// TestStore_CreateBatch_InterleavedAndRepeatedHatches proves the batch
+// predecessor rules inside one transaction: a repeated hatch later in the
+// batch links to the EARLIER BATCH row, while a hatch not yet seen in the
+// batch continues the chain already committed in the database.
+func TestStore_CreateBatch_InterleavedAndRepeatedHatches(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, ":memory:")
+	require.NoError(t, err)
+	defer st.Close()
+
+	// Pre-existing committed chains for 1H and 2H.
+	p1 := mustCreate(t, ctx, st, "V-B", "1H", 30)
+	p2 := mustCreate(t, ctx, st, "V-B", "2H", 29)
+
+	// Five rows in MEASUREMENT order: hatches interleave and 1H repeats.
+	items := []BatchItem{
+		batchRow(t, "V-B", "1H", 24), // row 1: continues the committed 1H chain -> p1
+		batchRow(t, "V-B", "2H", 23), // row 2: continues the committed 2H chain -> p2
+		batchRow(t, "V-B", "1H", 26), // row 3: same hatch earlier IN BATCH -> row 1
+		batchRow(t, "V-B", "3H", 25), // row 4: first measurement of 3H -> no predecessor
+		batchRow(t, "V-B", "1H", 22), // row 5: latest in-batch 1H -> row 3
+	}
+	saved, err := st.CreateBatch(ctx, items)
+	require.NoError(t, err)
+	require.Len(t, saved, 5)
+
+	// Submission order is preserved and ids are consecutive (inserted in one
+	// transaction, one after another).
+	for i, a := range saved {
+		assert.Equal(t, items[i].Input.Hatch, a.Input.Hatch)
+		if i > 0 {
+			assert.Equal(t, saved[i-1].ID+1, a.ID)
+		} else {
+			assert.Equal(t, p2.ID+1, a.ID)
+		}
+	}
+
+	assert.True(t, saved[0].HasPrev && saved[0].PrevID == p1.ID, "row 1 takes the DB's latest 1H predecessor")
+	assert.True(t, saved[1].HasPrev && saved[1].PrevID == p2.ID, "row 2 takes the DB's latest 2H predecessor")
+	assert.True(t, saved[2].HasPrev && saved[2].PrevID == saved[0].ID, "row 3 links the earlier in-batch 1H row, not p1")
+	assert.False(t, saved[3].HasPrev, "row 4 is the first 3H measurement anywhere")
+	assert.True(t, saved[4].HasPrev && saved[4].PrevID == saved[2].ID, "row 5 links the most recent in-batch 1H row")
+
+	// After the batch, standalone creates continue each chain at the batch's
+	// last row (batch rows are ordinary committed records).
+	after2H := mustCreate(t, ctx, st, "V-B", "2H", 21)
+	assert.Equal(t, saved[1].ID, after2H.PrevID)
+	after3H := mustCreate(t, ctx, st, "V-B", "3H", 20)
+	assert.Equal(t, saved[3].ID, after3H.PrevID)
+
+	// List reflects true creation order (newest first).
+	list, err := st.List(ctx)
+	require.NoError(t, err)
+	require.Len(t, list, 9)
+	assert.Equal(t, after3H.ID, list[0].ID)
+	assert.Equal(t, after2H.ID, list[1].ID)
+	assert.Equal(t, saved[4].ID, list[2].ID)
+	assert.Equal(t, saved[0].ID, list[6].ID)
+	assert.Equal(t, p2.ID, list[7].ID)
+	assert.Equal(t, p1.ID, list[8].ID)
+
+	// Overview uses MAX(id) per hatch: 1H latest is row 5, 2H the post-batch row.
+	latest, err := st.LatestByVoyage(ctx, "V-B")
+	require.NoError(t, err)
+	require.Len(t, latest, 3)
+	byHatch := map[string]*Assessment{}
+	for _, a := range latest {
+		byHatch[a.Input.Hatch] = a
+	}
+	assert.Equal(t, saved[4].ID, byHatch["1H"].ID)
+	assert.Equal(t, after2H.ID, byHatch["2H"].ID)
+	assert.Equal(t, after3H.ID, byHatch["3H"].ID)
+}
+
+// A batch whose voyage+hatch has no committed history starts its chains
+// inside the batch; the first occurrence is a first measurement.
+func TestStore_CreateBatch_StartsNewChainsInBatch(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, ":memory:")
+	require.NoError(t, err)
+	defer st.Close()
+
+	saved, err := st.CreateBatch(ctx, []BatchItem{
+		batchRow(t, "V-NEW", "1H", 25),
+		batchRow(t, "V-NEW", "1H", 24),
+		batchRow(t, "V-NEW", "1H", 23),
+	})
+	require.NoError(t, err)
+	require.Len(t, saved, 3)
+	assert.False(t, saved[0].HasPrev)
+	assert.Equal(t, saved[0].ID, saved[1].PrevID)
+	assert.Equal(t, saved[1].ID, saved[2].PrevID)
+}
+
+// TestStore_CreateBatch_MidBatchFailureRollsEverythingBack simulates a real
+// persistence failure on a MIDDLE insert (a trigger aborts one specific row).
+// The whole transaction must roll back: none of the earlier rows survive and
+// no predecessor link is left dangling.
+func TestStore_CreateBatch_MidBatchFailureRollsEverythingBack(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, ":memory:")
+	require.NoError(t, err)
+	defer st.Close()
+
+	before := mustCreate(t, ctx, st, "V-RB", "1H", 30)
+
+	// Abort the insert of the sentinel hatch in the MIDDLE of the batch.
+	_, err = st.db.ExecContext(ctx, `
+CREATE TRIGGER trg_fail_batch
+BEFORE INSERT ON assessments
+WHEN NEW.hatch = 'BOOM'
+BEGIN
+	SELECT RAISE(ABORT, 'simulated mid-batch storage failure');
+END`)
+	require.NoError(t, err)
+
+	_, err = st.CreateBatch(ctx, []BatchItem{
+		batchRow(t, "V-RB", "1H", 25), // would chain to `before`
+		batchRow(t, "V-RB", "BOOM", 24),
+		batchRow(t, "V-RB", "1H", 23),
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "simulated mid-batch storage failure")
+
+	list, err := st.List(ctx)
+	require.NoError(t, err)
+	require.Len(t, list, 1, "no batch row may survive the rollback")
+	assert.Equal(t, before.ID, list[0].ID)
+
+	// The chain is intact: a later valid create still links the pre-batch row.
+	after := mustCreate(t, ctx, st, "V-RB", "1H", 22)
+	assert.Equal(t, before.ID, after.PrevID, "no broken predecessor link after rollback")
+}
+
 // mustCreateAt is the timestamp-injecting counterpart of mustCreate: it lets
 // a test give two rows the SAME created_at so latest-per-hatch selection is
 // forced onto the record id instead of timestamp recency.

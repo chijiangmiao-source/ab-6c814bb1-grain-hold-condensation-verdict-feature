@@ -111,3 +111,63 @@ table.kv td:first-child { color: var(--muted); width: 46%; }
 }
 .compare-unavailable strong { color: var(--warn); font-size: 14px; }
 .compare-unavailable .note { margin: 4px 0 0; }
+
+/* ---- Single/batch mode switch ------------------------------------------- */
+.mode-switch {
+  display: flex; gap: 8px; margin: -4px 0 16px;
+  border-bottom: 1px solid var(--line); padding-bottom: 12px;
+}
+.mode-switch button {
+  width: auto; flex: 1; padding: 8px 10px;
+  background: #eef1f5; color: var(--muted);
+  border: 1px solid var(--line); border-radius: 8px;
+  font-size: 13.5px; font-weight: 600;
+}
+.mode-switch button.active {
+  background: #144d85; color: #fff; border-color: #144d85;
+}
+
+/* ---- Bulk batch entry table --------------------------------------------- */
+.batch-table-wrap { overflow-x: auto; margin-bottom: 12px; }
+.batch-table { font-size: 13px; }
+.batch-table th { white-space: nowrap; padding: 6px 6px; }
+.batch-table td { padding: 4px 6px; vertical-align: top; }
+.batch-table input {
+  width: 100%; min-width: 78px; padding: 7px 8px;
+  border: 1px solid #c3ccd8; border-radius: 6px; font-size: 13.5px;
+}
+.batch-table input:focus { outline: 2px solid #2f6fed33; border-color: #2f6fed; }
+.batch-table .col-idx { width: 34px; text-align: center; }
+.batch-table .col-op { width: 34px; }
+.batch-row.row-invalid { background: var(--bad-bg); }
+.batch-row.row-invalid .bad-idx {
+  display: inline-block; min-width: 20px; padding: 1px 0;
+  border-radius: 999px; background: var(--bad); color: #fff;
+  font-weight: 700; font-size: 12px;
+}
+.batch-table .field-err { font-size: 11.5px; white-space: nowrap; }
+.batch-table td.invalid { background: var(--bad-bg); }
+
+.row-del {
+  width: 26px; padding: 4px 0; font-size: 12px; line-height: 1;
+  background: transparent; color: var(--muted);
+  border: 1px solid var(--line); border-radius: 6px;
+}
+.row-del:hover:not(:disabled) { background: var(--bad-bg); color: var(--bad); border-color: var(--bad); }
+
+.add-row {
+  width: 100%; margin-bottom: 14px; padding: 9px;
+  background: #eef3fa; color: #144d85;
+  border: 1px dashed #9db8d8; border-radius: 8px;
+  font-size: 13.5px; font-weight: 600;
+}
+.add-row:hover:not(:disabled) { background: #e0eaf6; }
+.add-row:disabled { opacity: 0.55; }
+
+.batch-submit { margin-top: 2px; }
+.locate-hint { display: block; margin-top: 4px; font-size: 12.5px; }
+
+/* ---- Batch result table -------------------------------------------------- */
+.batch-result-table { margin-top: 8px; }
+.batch-result-table th, .batch-result-table td { white-space: nowrap; }
+.batch-result-table td:nth-child(4) { font-variant-numeric: tabular-nums; }

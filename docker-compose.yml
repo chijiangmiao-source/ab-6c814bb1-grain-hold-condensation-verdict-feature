@@ -1,0 +1,70 @@
+# Bulk-grain ventilation decision stack:
+#   web  — Vue 3 SPA served by nginx, reverse-proxying /api to the API
+#   api  — Go Gin + SQLite (pure-Go modernc driver, static binary)
+#   verify — one-shot acceptance run (testify + independent probe + Playwright)
+#
+# Override host ports:
+#   WEB_PORT=9000 API_PORT=9001 docker compose up --build
+# Run acceptance once and exit:
+#   docker compose run --rm verify
+
+services:
+  api:
+    build:
+      context: ./api
+    image: grain-ventilation-api:dev
+    environment:
+      API_PORT: "8080"
+      DB_PATH: /data/ventilation.db
+    ports:
+      - "${API_PORT:-8080}:8080"
+    volumes:
+      - api-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./web
+    image: grain-ventilation-web:dev
+    ports:
+      - "${WEB_PORT:-8081}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1/"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  verify:
+    build:
+      context: ./verify
+    image: grain-ventilation-verify:dev
+    profiles: ["verify"]
+    # One-shot container: run as root so it can write node_modules into the
+    # bind-mounted source; Playwright adds --no-sandbox automatically.
+    user: "0:0"
+    environment:
+      ASSERT_API_ORIGIN: http://api:8080
+      ASSERT_WEB_ORIGIN: http://web:80
+      PLAYWRIGHT_BASE_URL: http://web:80
+      # Browsers are already baked into the Playwright base image.
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+    volumes:
+      - ./:/workspace
+    depends_on:
+      api:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  api-data:
